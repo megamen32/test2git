@@ -170,8 +170,15 @@ def run_pytest(subproject: str) -> dict:
         elif stripped.startswith("ERROR ") or " ERROR" in stripped:
             if stripped.startswith("ERROR "):
                 test_id = stripped[len("ERROR "):].split(" ")[0].strip()
+                # Summary lines are "ERROR tests/test_x.py::test_y". Captured
+                # log lines like "ERROR root:post.py:1066 message" have no
+                # "::" and are not test results.
+                if "::" not in test_id:
+                    continue
             else:
                 test_id = stripped.split(" ERROR")[0].strip()
+                if "::" not in test_id:
+                    continue
             failure_ids.append({"id": test_id, "kind": "error"})
 
     # Deduplicate failure IDs (verbose mode prints them in both the test line and summary).
