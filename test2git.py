@@ -239,6 +239,100 @@ def write_results(record: dict) -> None:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def load_history(subproject: str, history_path=None) -> list:
+    """Previous history records for a subproject, oldest first."""
+    path = history_path or (OUTPUT_DIR / "history.jsonl")
+    path = Path(path)
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("subproject") == subproject:
+            records.append(rec)
+    records.sort(key=lambda r: str(r.get("ts", "")))
+    return records
+
+
+def _is_green(rec: dict) -> bool:
+    return rec.get("failed", 0) == 0 and rec.get("errors", 0) == 0
+
+
+def attach_blame(record: dict, history_path=None) -> None:
+    """On a RED run, add the blame block: who broke it and when it last passed.
+
+    ``introduced_by_this_run`` is True only when the immediately previous run
+    of this subproject was GREEN — i.e. the world was fine until this push.
+    When False, the suite was already RED before this push, and ``last_green``
+    names the last commit where everything passed. Must be called BEFORE
+    write_results() appends the current record.
+    """
+    if record.get("failed", 0) == 0 and record.get("errors", 0) == 0:
+        return
+
+    prev = load_history(record["subproject"], history_path)
+    if not prev:
+        record["blame"] = {
+            "last_green": None,
+            "runs_since_last_green": None,
+            "previous_run": None,
+            "introduced_by_this_run": None,
+            "note": "no previous runs recorded for this subproject",
+        }
+        return
+
+    last_run = prev[-1]
+    greens = [r for r in prev if _is_green(r)]
+    blame = {
+        "previous_run": {
+            "ts": last_run.get("ts"),
+            "commit": last_run.get("commit"),
+            "green": _is_green(last_run),
+        },
+    }
+    if greens:
+        lg = greens[-1]
+        blame["last_green"] = {
+            "ts": lg.get("ts"),
+            "commit": lg.get("commit"),
+            "branch": lg.get("branch"),
+        }
+        blame["runs_since_last_green"] = len(prev) - 1 - prev.index(lg)
+        blame["introduced_by_this_run"] = _is_green(last_run)
+    else:
+        blame["last_green"] = None
+        blame["runs_since_last_green"] = None
+        blame["introduced_by_this_run"] = False
+        blame["note"] = "no GREEN run in recorded history"
+    record["blame"] = blame
+
+
+def format_blame_line(record: dict) -> str:
+    """Human one-liner for the console (pre-push hook output)."""
+    blame = record.get("blame")
+    if not blame:
+        return ""
+    prev = blame.get("previous_run")
+    lg = blame.get("last_green")
+    if blame.get("introduced_by_this_run") is None and prev is None:
+        return "; no previous runs in history — cannot attribute"
+    if blame.get("introduced_by_this_run"):
+        return (f"; introduced by THIS push — previous run "
+                f"{prev['commit']} ({prev['ts']}) was GREEN")
+    if lg is None:
+        return "; already RED before this push — no GREEN run in history"
+    runs = blame.get("runs_since_last_green")
+    runs_txt = f"{runs} run(s) ago" if runs is not None else "earlier"
+    return (f"; already RED before this push — last GREEN was "
+            f"{lg['commit']} ({lg['ts']}), {runs_txt}")
+
+
 def update_gitignore(keep: bool) -> None:
     """Manage .gitignore entry for .test2git/."""
     gitignore = REPO_ROOT / ".gitignore"
@@ -292,12 +386,14 @@ def main() -> int:
         if "error" in record and "subproject" in record:
             print(f"[test2git] {sub}: {record['error']}")
             continue
+        attach_blame(record)
         write_results(record)
         status = "GREEN" if record["failed"] == 0 and record["errors"] == 0 else "RED"
+        blame_line = format_blame_line(record) if status == "RED" else ""
         print(f"[test2git] {sub}: {status} — "
               f"{record['passed']} passed, {record['failed']} failed, "
               f"{record['errors']} errors ({record['duration_s']}s) "
-              f"→ .test2git/{sub}.txt + {sub}.json")
+              f"→ .test2git/{sub}.txt + {sub}.json{blame_line}")
         total_failures += record["failed"] + record["errors"]
 
     if args.keep:
