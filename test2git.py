@@ -159,8 +159,11 @@ def run_pytest(subproject: str) -> dict:
     for line in raw_output.splitlines():
         stripped = line.strip()
         # In -v mode: "tests/test_x.py::test_y FAILED" or "... PASSED" etc.
-        # Also handle "FAILED tests/..." summary lines (non-verbose mode).
-        if " FAILED" in stripped and ("::" in stripped or stripped.startswith("FAILED ")):
+        # In -q/-rf mode the short summary starts the line with "FAILED ".
+        # Both shapes must match: the old condition required a leading space
+        # before FAILED, so "FAILED <id>" summary lines were silently dropped
+        # and the JSON ended up with counts but an empty failure list.
+        if (" FAILED" in stripped or stripped.startswith("FAILED ")) and "::" in stripped:
             # Extract test ID: everything before " FAILED"
             if stripped.startswith("FAILED "):
                 test_id = stripped[len("FAILED "):].split(" ")[0].strip()
