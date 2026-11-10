@@ -76,6 +76,13 @@ Three files land in `.test2git/` on every push: `<sub>.json` (above),
 Sorted, deduplicated, machine-readable, written by every push. The agent
 never needs to run pytest itself.
 
+## Blast radius (optional)
+
+Put `# LHC:COVERS src/a.py src/b.py` as the first line of a test file and set
+`TEST2GIT_BLAST=1`: a push then runs only the tests naming the changed files
+(pytest, `go test`, vitest/jest). Source files no test names fall back to the
+full suite. See [Blast radius](docs/ADVANCED.md#blast-radius-lhccovers).
+
 ## Start in minutes
 
 1. Run the install command above inside any git repo.

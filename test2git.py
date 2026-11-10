@@ -54,8 +54,11 @@ every test run's full output over time.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -87,17 +90,163 @@ SUBPROJECTS: dict[str, dict] = {
 
 OUTPUT_DIR = REPO_ROOT / ".test2git"
 
+# Pseudo-subproject for pytest files that live outside every SUBPROJECTS dir.
+ROOT_SUBPROJECT = {
+    "dir": REPO_ROOT, "python": None,
+    "pytest_args": ["--tb=short", "-v"], "test_dirs": ["."],
+}
 
-def detect_subprojects_from_git() -> list[str]:
-    """Detect which subprojects have staged/changed files."""
+# Blast-radius runners by language (edit here like SUBPROJECTS): which source
+# extensions belong to the runner and which file names are its test files.
+RUNNERS: dict[str, dict] = {
+    "pytest": {"source_ext": [".py"], "test_globs": ["test_*.py", "*_test.py"]},
+    "go": {"source_ext": [".go"], "test_globs": ["*_test.go"]},
+    "js": {"source_ext": [".js", ".ts"],
+           "test_globs": ["*.test.js", "*.test.ts", "*.spec.js", "*.spec.ts"]},
+}
+COVERS_TOKEN = "LHC:COVERS"
+
+
+# ── Blast radius: pure logic ─────────────────────────────────────────────
+def parse_covers(text: str) -> list[str]:
+    """Source paths named by ``LHC:COVERS`` in the first 10 lines (any comment prefix)."""
+    for line in text.splitlines()[:10]:
+        head, token, rest = line.partition(COVERS_TOKEN)
+        if token and re.fullmatch(r"\W*", head):
+            return [p for p in rest.split() if p not in ("*/", "-->", "--%>")]
+    return []
+
+
+def classify(path: str) -> tuple[str | None, bool]:
+    """Return (runner, is_test) for a path; runner is None for non-code files."""
+    name = path.rsplit("/", 1)[-1]
+    for runner, cfg in RUNNERS.items():
+        if any(fnmatch.fnmatch(name, g) for g in cfg["test_globs"]):
+            return runner, True
+    for runner, cfg in RUNNERS.items():
+        if any(name.endswith(e) for e in cfg["source_ext"]):
+            return runner, False
+    return None, False
+
+
+def select_tests(changed: list[str], covers: dict[str, list[str]]) -> dict:
+    """Tests to run for a change set, plus source files no test names."""
+    tests: set[str] = set()
+    uncovered: list[str] = []
+    for f in changed:
+        runner, is_test = classify(f)
+        if runner is None:
+            continue
+        if is_test:
+            tests.add(f)
+            continue
+        hit = [t for t, srcs in covers.items() if f in srcs]
+        if hit:
+            tests.update(hit)
+        else:
+            uncovered.append(f)
+    return {"tests": sorted(tests), "uncovered": sorted(set(uncovered))}
+
+
+def subproject_of(path: str, subprojects: dict | None = None) -> str | None:
+    """Name of the configured subproject containing ``path`` (repo-relative)."""
+    for name, cfg in (subprojects or SUBPROJECTS).items():
+        if path.startswith(cfg["dir"].name + "/"):
+            return name
+    return None
+
+
+def plan_runs(tests: list[str], uncovered: list[str]) -> list[dict]:
+    """Turn a selection into runs. Uncovered files fall back to the full suite
+    of their subproject/runner; tests inside a falling-back suite are dropped
+    because the full run already contains them."""
+    full_py: dict[str, list[str]] = {}
+    full_other: dict[str, list[str]] = {}
+    for f in uncovered:
+        runner = classify(f)[0]
+        if runner == "pytest":
+            full_py.setdefault(subproject_of(f) or "root", []).append(f)
+        else:
+            full_other.setdefault(str(runner), []).append(f)
+    specs = [{"runner": "pytest", "subproject": s, "files": [], "mode": "full", "uncovered": u}
+             for s, u in sorted(full_py.items())]
+    specs += [{"runner": r, "subproject": r, "files": [], "mode": "full", "uncovered": u}
+              for r, u in sorted(full_other.items())]
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for t in tests:
+        runner = classify(t)[0]
+        sub = (subproject_of(t) or "root") if runner == "pytest" else str(runner)
+        if (runner == "pytest" and sub in full_py) or (runner != "pytest" and sub in full_other):
+            continue
+        grouped.setdefault((str(runner), sub), []).append(t)
+    specs += [{"runner": r, "subproject": s, "files": fs, "mode": "blast", "uncovered": []}
+              for (r, s), fs in sorted(grouped.items())]
+    return specs
+
+
+def go_packages(tests: list[str]) -> list[str]:
+    """Unique ``./dir/...`` package patterns for Go test files."""
+    dirs = sorted({t.rsplit("/", 1)[0] if "/" in t else "." for t in tests})
+    return ["./..." if d == "." else f"./{d}/..." for d in dirs]
+
+
+def is_red(record: dict) -> bool:
+    """True when a run failed: failing tests, an error, or a non-zero exit of a non-pytest runner."""
+    if record.get("error") or record.get("failed") or record.get("errors"):
+        return True
+    return record.get("runner") not in (None, "pytest") and record.get("exit_code") != 0
+
+
+def porcelain_files() -> list[str]:
+    """Changed/staged/untracked files from ``git status``."""
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain", "-u"],
             capture_output=True, text=True, cwd=REPO_ROOT,
         )
-        all_files = [line[3:] for line in result.stdout.strip().splitlines()] if result.stdout.strip() else []
     except Exception:
         return []
+    return [line[3:].split(" -> ")[-1].strip('"') for line in result.stdout.splitlines()]
+
+
+def range_files(ranges: list[str]) -> list[str]:
+    """Files changed in git ranges (``a..b``), deleted ones excluded."""
+    found: set[str] = set()
+    for rng in ranges:
+        out = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=d", rng],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        ).stdout
+        found.update(out.splitlines())
+    return sorted(found)
+
+
+def covers_index() -> dict[str, list[str]]:
+    """``{test file: covered sources}`` from every test file carrying LHC:COVERS."""
+    if shutil.which("rg"):
+        cmd = ["rg", "-l", "--no-messages", COVERS_TOKEN]
+    else:
+        cmd = ["git", "grep", "-l", COVERS_TOKEN]
+    # stdin=DEVNULL: rg searches a piped stdin (the hook's) instead of the tree.
+    out = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT,
+                         stdin=subprocess.DEVNULL).stdout
+    index: dict[str, list[str]] = {}
+    for path in out.splitlines():
+        if not classify(path)[1]:
+            continue
+        try:
+            head = (REPO_ROOT / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        paths = parse_covers(head)
+        if paths:
+            index[path] = paths
+    return index
+
+
+def detect_subprojects_from_git() -> list[str]:
+    """Detect which subprojects have staged/changed files."""
+    all_files = porcelain_files()
 
     found: list[str] = []
     for name, cfg in SUBPROJECTS.items():
@@ -123,12 +272,16 @@ def get_git_info(sub_dir: Path) -> tuple[str, str]:
         return "unknown", "unknown"
 
 
-def run_pytest(subproject: str) -> dict:
-    """Run pytest for a subproject, return structured result."""
-    cfg = SUBPROJECTS[subproject]
+def run_pytest(subproject: str, files: list[str] | None = None,
+               uncovered: list[str] | None = None, mode: str = "full") -> dict:
+    """Run pytest for a subproject (or only ``files``, repo-relative), return structured result."""
+    cfg = SUBPROJECTS.get(subproject) or ROOT_SUBPROJECT
     sub_dir = cfg["dir"]
     python = str(cfg["python"] or sys.executable)
-    test_paths = [str(sub_dir / td) for td in cfg["test_dirs"] if (sub_dir / td).is_dir()]
+    if files:
+        test_paths = [str(REPO_ROOT / f) for f in files]
+    else:
+        test_paths = [str(sub_dir / td) for td in cfg["test_dirs"] if (sub_dir / td).is_dir()]
     if not test_paths:
         return {"subproject": subproject, "error": "no test dirs found"}
 
@@ -232,15 +385,82 @@ def run_pytest(subproject: str) -> dict:
         "skipped": skipped,
         "duration_s": round(duration, 1),
         "pytest_exit_code": proc.returncode,
+        "exit_code": proc.returncode,
         "raw_output_file": raw_output_file.name,
         "failures": sorted(failure_ids, key=lambda f: f["id"]),
+        "mode": mode,
+        "runner": "pytest",
+        "selected_tests": list(files or []),
+        "uncovered": list(uncovered or []),
     }
     return record
+
+
+def other_record(spec: dict, **fields) -> dict:
+    """Record for a non-pytest run (or an error): counts stay null, exit code is the truth."""
+    commit, branch = get_git_info(REPO_ROOT)
+    record = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "commit": commit, "branch": branch,
+        "subproject": spec["subproject"],
+        "passed": None, "failed": None, "errors": None, "skipped": None,
+        "duration_s": 0.0, "exit_code": None, "raw_output_file": None, "failures": [],
+        "mode": spec["mode"], "runner": spec["runner"],
+        "selected_tests": list(spec["files"]), "uncovered": list(spec["uncovered"]),
+    }
+    record.update(fields)
+    return record
+
+
+def other_command(spec: dict) -> tuple[list[str] | None, str]:
+    """(command, error) for a go/js spec; the command is None when the runner is unavailable."""
+    if spec["runner"] == "go":
+        if not shutil.which("go"):
+            return None, "go executable not found"
+        pkgs = ["./..."] if spec["mode"] == "full" else go_packages(spec["files"])
+        return ["go", "test", *pkgs], ""
+    if spec["runner"] == "js":
+        if spec["mode"] == "full":
+            return None, "no full-suite fallback for JS: add LHC:COVERS to a test of the changed files"
+        bins = REPO_ROOT / "node_modules" / ".bin"
+        if not shutil.which("npx"):
+            return None, "no JS runner found (npx missing)"
+        if (bins / "vitest").exists():
+            return ["npx", "--no-install", "vitest", "run", *spec["files"]], ""
+        if (bins / "jest").exists():
+            return ["npx", "--no-install", "jest", *spec["files"]], ""
+        return None, "no JS runner found (neither vitest nor jest in node_modules/.bin)"
+    return None, f"no runner for {spec['runner']}"
+
+
+def run_other(spec: dict) -> dict:
+    """Run a go/js spec, store exit code, duration and raw output."""
+    cmd, error = other_command(spec)
+    if cmd is None:
+        return other_record(spec, error=error, errors=1)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    raw_file = OUTPUT_DIR / f"{spec['subproject']}.txt"
+    print(f"[test2git] running {' '.join(cmd[:5])}... in {REPO_ROOT}")
+    start = datetime.now()
+    try:
+        with open(raw_file, "w", encoding="utf-8") as fh:
+            proc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, text=True, cwd=REPO_ROOT)
+    except OSError as exc:
+        return other_record(spec, error=f"cannot start {cmd[0]}: {exc}", errors=1)
+    return other_record(spec, exit_code=proc.returncode, raw_output_file=raw_file.name,
+                        duration_s=round((datetime.now() - start).total_seconds(), 1))
+
+
+def run_spec(spec: dict) -> dict:
+    if spec["runner"] == "pytest":
+        return run_pytest(spec["subproject"], spec["files"], spec["uncovered"], spec["mode"])
+    return run_other(spec)
 
 
 def write_results(record: dict) -> None:
     """Write the JSON summary file + append to history."""
     sub = record["subproject"]
+    OUTPUT_DIR.mkdir(exist_ok=True)
     (OUTPUT_DIR / f"{sub}.json").write_text(
         json.dumps(record, indent=2, ensure_ascii=False))
 
@@ -271,7 +491,7 @@ def load_history(subproject: str, history_path=None) -> list:
 
 
 def _is_green(rec: dict) -> bool:
-    return rec.get("failed", 0) == 0 and rec.get("errors", 0) == 0
+    return not is_red(rec)
 
 
 def attach_blame(record: dict, history_path=None) -> None:
@@ -283,7 +503,7 @@ def attach_blame(record: dict, history_path=None) -> None:
     names the last commit where everything passed. Must be called BEFORE
     write_results() appends the current record.
     """
-    if record.get("failed", 0) == 0 and record.get("errors", 0) == 0:
+    if not is_red(record):
         return
 
     prev = load_history(record["subproject"], history_path)
@@ -360,6 +580,40 @@ def update_gitignore(keep: bool) -> None:
             gitignore.write_text(content.rstrip() + "\n.test2git/\n")
 
 
+def report(record: dict) -> int:
+    """Print one result line; return how many failures it adds."""
+    sub = record["subproject"]
+    status = "RED" if is_red(record) else "GREEN"
+    blame_line = format_blame_line(record) if status == "RED" else ""
+    if record.get("passed") is None:
+        counts = record.get("error") or f"exit code {record.get('exit_code')}"
+    else:
+        counts = (f"{record['passed']} passed, {record['failed']} failed, "
+                  f"{record['errors']} errors")
+    print(f"[test2git] {sub}: {status} [{record.get('mode')}] — {counts} "
+          f"({record['duration_s']}s) → .test2git/{sub}.txt + {sub}.json{blame_line}")
+    return (record.get("failed") or 0) + (record.get("errors") or 0) + (
+        1 if status == "RED" and not (record.get("failed") or record.get("errors")) else 0)
+
+
+def run_blast(ranges: list[str]) -> list[dict]:
+    """Run only the tests that name the changed files; see README «Blast radius»."""
+    changed = range_files(ranges) if ranges else [
+        f for f in porcelain_files() if (REPO_ROOT / f).exists()]
+    sel = select_tests(changed, covers_index())
+    if sel["uncovered"]:
+        print("[test2git] WARNING: no test names these files (add `LHC:COVERS` to a test): "
+              + ", ".join(sel["uncovered"]) + " — running the full suite for them")
+    specs = plan_runs(sel["tests"], sel["uncovered"])
+    if not specs:
+        print("[test2git] blast: no relevant code changes, nothing to run")
+        return [other_record(
+            {"subproject": "blast", "mode": "blast", "runner": None, "files": [], "uncovered": []},
+            passed=0, failed=0, errors=0, skipped=0, exit_code=0,
+            note="no relevant code changes")]
+    return [run_spec(spec) for spec in specs]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="test2git — run tests, write results to file for AI agents.")
@@ -370,9 +624,27 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true",
                         help="Commit results in git (un-gitignore .test2git/). "
                              "Gives full test versioning: git log -- .test2git/")
+    parser.add_argument("--blast", action="store_true",
+                        help="Run only tests whose LHC:COVERS header names a changed file "
+                             "(uncovered source files fall back to the full suite).")
+    parser.add_argument("--full", action="store_true",
+                        help="Force the full suite (overrides --blast).")
+    parser.add_argument("--range", action="append", default=[], metavar="A..B",
+                        help="Git range of changed files for --blast (pre-push hook); "
+                             "default: git status.")
     args = parser.parse_args()
 
     update_gitignore(keep=False)
+
+    if args.blast and not args.full:
+        total_failures = 0
+        for record in run_blast(args.range):
+            attach_blame(record)
+            write_results(record)
+            total_failures += report(record)
+        if args.keep:
+            update_gitignore(keep=True)
+        return 1 if args.fail_on_error and total_failures > 0 else 0
 
     if args.subproject is None:
         subs = detect_subprojects_from_git()
@@ -393,18 +665,12 @@ def main() -> int:
     total_failures = 0
     for sub in subs:
         record = run_pytest(sub)
-        if "error" in record and "subproject" in record:
+        if "error" in record and "runner" not in record:
             print(f"[test2git] {sub}: {record['error']}")
             continue
         attach_blame(record)
         write_results(record)
-        status = "GREEN" if record["failed"] == 0 and record["errors"] == 0 else "RED"
-        blame_line = format_blame_line(record) if status == "RED" else ""
-        print(f"[test2git] {sub}: {status} — "
-              f"{record['passed']} passed, {record['failed']} failed, "
-              f"{record['errors']} errors ({record['duration_s']}s) "
-              f"→ .test2git/{sub}.txt + {sub}.json{blame_line}")
-        total_failures += record["failed"] + record["errors"]
+        total_failures += report(record)
 
     if args.keep:
         update_gitignore(keep=True)
