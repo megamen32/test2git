@@ -165,11 +165,45 @@ chmod +x .git/hooks/pre-push
 
 Or rename it: `mv .git/hooks/pre-push .git/hooks/pre-push.disabled`.
 
+## Blast radius: `LHC:COVERS`
+
+Run only the tests of the files a change touched. Every test file starts with
+one comment line naming the source files it checks (repo-root paths, space
+separated, any comment syntax, within the first 10 lines):
+
+```python
+# LHC:COVERS src/billing/price.py src/billing/tax.py
+```
+```go
+// LHC:COVERS internal/price/price.go
+```
+
+Switch it on with `TEST2GIT_BLAST=1` in the environment of `git push` (default
+is off: full suite). The hook then passes the pushed range to
+`test2git.py --blast --range <remote sha>..<local sha>`; run by hand,
+`python3 scripts/test2git.py --blast` uses `git status`. `--full` forces the
+full suite.
+
+- A changed test file is selected itself; docs and configs are ignored.
+- A changed source file no test names is reported
+  ("no test names these files: add `LHC:COVERS`") and the **full suite** of its
+  subproject runs, so nothing goes untested. Nothing relevant changed: nothing
+  runs, a record says so.
+- Runners are the `RUNNERS` dict in `test2git.py`: `.py` -> pytest (uses the
+  subproject's python and `pytest_args`), `*_test.go` -> `go test ./dir/...`,
+  `*.test.js/ts`, `*.spec.js/ts` -> vitest, else jest from `node_modules/.bin`.
+  A missing runner is recorded as an error, never skipped. For go/js only
+  `exit_code`, duration and raw output are stored; counts are `null`.
+- Records in `.test2git/` gain `mode` (`blast`|`full`), `selected_tests`,
+  `uncovered`, `runner`, `exit_code`.
+- The hook uses blast mode only with the root layout `scripts/test2git.py`;
+  a new branch is diffed against `merge-base` with `origin/HEAD`, and when
+  that is unknown the full suite runs.
+
 ## Performance notes
 
-`test2git` runs the **full** pytest suite on every push. There is no
-incremental-test mode (yet). For most projects this is fine — pytest is fast
-enough on modern hardware — but if your suite takes >10 minutes, consider:
+By default `test2git` runs the **full** pytest suite on every push; for
+incremental runs see "Blast radius" above. For most projects this is fine, but if your suite takes >10 minutes, consider:
 
 - Running pytest with `-x` to abort on first failure (custom `pytest_args`).
 - Running `test2git.py` only on a schedule (e.g. a CI job, not the local

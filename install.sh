@@ -82,7 +82,7 @@ WITHOUT re-running the suite:
 
 Always read `.test2git/<sub>.json` first when resuming work to see the
 last known test state. Run `python scripts/test2git.py <sub>` manually
-to refresh. Uninstall: see scripts/test2git-repo/install.sh --uninstall.
+to refresh. Uninstall: run `install.sh --uninstall` from a test2git clone.
 <!-- test2git:end -->'
 
 inject_block() {
@@ -122,4 +122,4 @@ echo "[test2git] done. Files:"
 echo "  - $SCRIPTS_DIR/test2git.py"
 echo "  - $HOOK_PATH"
 echo "[test2git] try: git push   (hook will write .test2git/<sub>.json on each push)"
-echo "[test2git] uninstall: bash scripts/test2git-repo/install.sh --uninstall"
+echo "[test2git] uninstall: bash <test2git clone>/install.sh --uninstall"
