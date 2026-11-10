@@ -133,3 +133,11 @@ def test_e2e_full_flag_wins_and_missing_js_runner_is_error(tmp_path):
     proc = subprocess.run([sys.executable, "scripts/test2git.py", "--blast", "--full"],
                           cwd=repo, capture_output=True, text=True)
     assert "No changed files detected" in proc.stdout  # --full took the old path
+
+
+def test_e2e_piped_stdin_like_the_hook(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "src" / "a.py").write_text("X = 2\n")
+    proc = subprocess.run([sys.executable, "scripts/test2git.py", "--blast"], cwd=repo,
+                          input="refs/heads/m abc refs/heads/m def\n", capture_output=True, text=True)
+    assert "no test names" not in proc.stdout and "test_a" in (repo / ".test2git" / "root.txt").read_text()

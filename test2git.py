@@ -227,7 +227,9 @@ def covers_index() -> dict[str, list[str]]:
         cmd = ["rg", "-l", "--no-messages", COVERS_TOKEN]
     else:
         cmd = ["git", "grep", "-l", COVERS_TOKEN]
-    out = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT).stdout
+    # stdin=DEVNULL: rg searches a piped stdin (the hook's) instead of the tree.
+    out = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT,
+                         stdin=subprocess.DEVNULL).stdout
     index: dict[str, list[str]] = {}
     for path in out.splitlines():
         if not classify(path)[1]:
